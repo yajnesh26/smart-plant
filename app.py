@@ -2,6 +2,7 @@
 import sqlite3
 import json
 import time
+import atexit
 from flask import Flask, jsonify, render_template, request
 import threading
 import paho.mqtt.client as mqtt
@@ -16,6 +17,7 @@ app = Flask(__name__)
 CORS(app)  # allow cross-origin if needed
 
 latest_reading = {}
+latest_lock = threading.Lock()
 
 def init_db():
     conn = sqlite3.connect(DB_FILE)
@@ -61,12 +63,13 @@ def on_message(client, userdata, msg):
         insert_reading(ts, temperature, moisture, light)
 
         # Update latest
-        latest_reading = {
-            "timestamp": ts,
-            "temperature": temperature,
-            "moisture": moisture,
-            "light": light
-        }
+        with latest_lock:
+            latest_reading = {
+                "timestamp": ts,
+                "temperature": temperature,
+                "moisture": moisture,
+                "light": light
+            }
         print("Saved:", latest_reading)
     except Exception as e:
         print("Failed to process MQTT message:", e)
@@ -86,6 +89,10 @@ def index():
 
 @app.route("/api/latest")
 def api_latest():
+    with latest_lock:
+        lr = latest_reading.copy() if latest_reading else None
+    if lr:
+        return jsonify({"status": "ok", "data": lr})
     if latest_reading:
         return jsonify({"status": "ok", "data": latest_reading})
     else:
@@ -104,7 +111,11 @@ def api_latest():
 @app.route("/api/history")
 def api_history():
     # optional query param: ?limit=100
-    limit = int(request.args.get("limit", 100))
+    try:
+        limit = int(request.args.get("limit", 100))
+    except (TypeError, ValueError):
+        limit = 100
+    limit = max(1, min(limit, 1000))
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
     cur.execute("SELECT timestamp, temperature, moisture, light FROM readings ORDER BY id DESC LIMIT ?", (limit,))
@@ -118,8 +129,15 @@ def api_history():
 if __name__ == "__main__":
     init_db()
     mqtt_client = start_mqtt()
+
+    def cleanup():
+        try:
+            mqtt_client.loop_stop()
+            mqtt_client.disconnect()
+            print("MQTT client stopped")
+        except Exception as e:
+            print("Error while stopping MQTT:", e)
+    atexit.register(cleanup)
     # Run Flask without the reloader to avoid duplicate MQTT threads
     app.run(host="0.0.0.0", port=5000, debug=False, use_reloader=False)
     # when app stops:
-    mqtt_client.loop_stop()
-    mqtt_client.disconnect()
